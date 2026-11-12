@@ -69,7 +69,11 @@ func Exchange(ctx context.Context, reg name.Registry, auth authn.Authenticator, 
 // FromToken returns a transport given a Challenge + Token.
 func FromToken(reg name.Registry, auth authn.Authenticator, t http.RoundTripper, pr *Challenge, tok *Token) (http.RoundTripper, error) {
 	if strings.ToLower(pr.Scheme) != "bearer" {
-		return &Wrapper{&basicTransport{inner: t, auth: auth, target: reg.RegistryStr()}}, nil
+		scheme := "https"
+		if pr.Insecure {
+			scheme = "http"
+		}
+		return &Wrapper{&basicTransport{inner: t, auth: auth, target: reg.RegistryStr(), scheme: scheme}}, nil
 	}
 	bt, err := fromChallenge(reg, auth, t, pr)
 	if err != nil {
@@ -175,9 +179,20 @@ type bearerTransport struct {
 	scopes  []string
 	// Scheme we should use, determined by ping response.
 	scheme string
+	// refreshAttempts counts same-host 401-driven token exchanges per request,
+	// keyed by the request pointer. It bounds the per-request refresh loop and is
+	// cleaned up when the request's challenge handling finishes.
+	refreshAttempts map[*http.Request]int
 }
 
 var _ http.RoundTripper = (*bearerTransport)(nil)
+
+// maxSameHostRefreshes bounds the number of bearer-token exchanges a single
+// request may trigger in response to same-host 401 challenges. Normal flows
+// need at most a handful (initial token plus a few scope escalations); a
+// registry that keeps challenging past this is treated as a failure rather than
+// an unbounded loop.
+const maxSameHostRefreshes = 3
 
 var portMap = map[string]string{
 	"http":  "80",
@@ -229,8 +244,17 @@ func (bt *bearerTransport) RoundTrip(in *http.Request) (*http.Response, error) {
 		if !matchesHost(bt.registry.RegistryStr(), in, bt.scheme) {
 			return bt.handleCrossHostChallenge(in, challenges)
 		}
+		// Whatever path this request's challenge handling takes (another refresh,
+		// the no-progress/ceiling return, or an error), drop its per-request
+		// counter on the way out so the map cannot grow without bound.
+		defer bt.forgetRefreshAttempt(in)
 
+		// addedScopes tracks scopes from this challenge that we were not already
+		// requesting. If none are added, another refresh cannot change the token's
+		// privileges, so retrying would make no progress.
+		addedScopes := []string{}
 		newScopes := []string{}
+		var attempts int
 		bt.mx.Lock()
 		got := stringSet(bt.scopes)
 		for _, wac := range challenges {
@@ -239,18 +263,41 @@ func (bt *bearerTransport) RoundTrip(in *http.Request) (*http.Response, error) {
 				// Add any scopes that we don't already request.
 				if _, ok := got[want]; !ok {
 					newScopes = append(newScopes, want)
+					addedScopes = append(addedScopes, want)
 				}
 			}
 		}
+		attempts = bt.refreshAttempts[in]
 
 		// Some registries seem to only look at the first scope parameter during a token exchange.
 		// If a request fails because it's missing a scope, we should put those at the beginning,
 		// otherwise the registry might just ignore it :/
 		newScopes = append(newScopes, bt.scopes...)
 		bt.scopes = newScopes
-		bt.mx.Unlock()
 
 		// TODO(jonjohnsonjr): Teach transport.Error about "error" and "error_description" from challenge.
+
+		// After the first refresh, stop when another exchange would make no
+		// progress (the challenge adds no scope we don't already hold, e.g. the
+		// token endpoint keeps issuing an unusable token) or when the per-request
+		// refresh ceiling has been reached. The first refresh is always allowed
+		// because a same-host 401 commonly means the current token simply expired.
+		stop := attempts > 0 && (len(addedScopes) == 0 || attempts >= maxSameHostRefreshes)
+		if stop {
+			tok := bt.bearer.RegistryToken
+			bt.mx.Unlock()
+
+			// Re-send once with the current token and return whatever response we
+			// get, including the 401, so the caller sees the real failure instead
+			// of an unbounded refresh loop.
+			in.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tok))
+			return bt.inner.RoundTrip(in)
+		}
+		if bt.refreshAttempts == nil {
+			bt.refreshAttempts = map[*http.Request]int{}
+		}
+		bt.refreshAttempts[in] = attempts + 1
+		bt.mx.Unlock()
 
 		// Retry the request to attempt to get a valid token.
 		if err = bt.refresh(in.Context()); err != nil {
@@ -265,6 +312,13 @@ func (bt *bearerTransport) RoundTrip(in *http.Request) (*http.Response, error) {
 	}
 
 	return res, err
+}
+
+// forgetRefreshAttempt drops the per-request refresh counter.
+func (bt *bearerTransport) forgetRefreshAttempt(req *http.Request) {
+	bt.mx.Lock()
+	delete(bt.refreshAttempts, req)
+	bt.mx.Unlock()
 }
 
 // handleCrossHostChallenge performs a per-host bearer token exchange when
@@ -420,10 +474,14 @@ func canonicalAddress(host, scheme string) (address string) {
 	// - ipv4
 	// - ipv4:port
 	// - ipv6
+	// - [ipv6]
 	// - [ipv6]:port
 	// As net.SplitHostPort returns an error if the host does not contain a port, we should only attempt
-	// to call it when we know that the address contains a port
-	if strings.Count(host, ":") == 1 || (strings.Count(host, ":") >= 2 && strings.Contains(host, "]:")) {
+	// to call it when we know that the address contains a port. A bare IPv6
+	// literal ("2001:db8::1") or a bracketed one without a port ("[2001:db8::1]")
+	// must fall through to the default-port branch below so it is canonicalized
+	// consistently with a hostname that omits its port.
+	if strings.Count(host, ":") == 1 || strings.Contains(host, "]:") {
 		hostname, port, err := net.SplitHostPort(host)
 		if err != nil {
 			return host
@@ -435,6 +493,11 @@ func canonicalAddress(host, scheme string) (address string) {
 		return net.JoinHostPort(hostname, port)
 	}
 
+	// Strip the brackets from a port-less IPv6 literal (e.g. "[::1]" -> "::1")
+	// so net.JoinHostPort re-adds them canonically with the default port.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
 	return net.JoinHostPort(host, portMap[scheme])
 }
 
@@ -506,6 +569,7 @@ func (bt *bearerTransport) refreshBasic(ctx context.Context) ([]byte, error) {
 		inner:  bt.inner,
 		auth:   bt.basic,
 		target: u.Host,
+		scheme: bt.scheme,
 	}
 	allowInsecure := bt.scheme == "http"
 	client := http.Client{Transport: b, CheckRedirect: realmRedirectCheck(bt.registry.RegistryStr(), allowInsecure)}

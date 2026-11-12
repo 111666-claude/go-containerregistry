@@ -82,7 +82,7 @@ func NewWithContext(ctx context.Context, reg name.Registry, auth authn.Authentic
 	}
 
 	if strings.ToLower(pr.Scheme) != "bearer" {
-		return &Wrapper{&basicTransport{inner: t, auth: auth, target: reg.RegistryStr()}}, nil
+		return &Wrapper{&basicTransport{inner: t, auth: auth, target: reg.RegistryStr(), scheme: scheme}}, nil
 	}
 
 	bt, err := fromChallenge(reg, auth, t, pr)

@@ -481,6 +481,18 @@ func TestCanonicalAddressResolution(t *testing.T) {
 		address:  "[2001:db8::1]:",
 		want:     "[2001:db8::1]:443",
 	}, {
+		// Bracketed IPv6 literal without a port must still get the scheme's
+		// default port, matching a hostname that omits its port.
+		registry: registry,
+		scheme:   "https",
+		address:  "[2001:db8::1]",
+		want:     "[2001:db8::1]:443",
+	}, {
+		registry: registry,
+		scheme:   "http",
+		address:  "[::1]",
+		want:     "[::1]:80",
+	}, {
 		registry: registry,
 		scheme:   "https",
 		address:  "something:is::wrong]:",

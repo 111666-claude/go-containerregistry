@@ -167,12 +167,18 @@ func TestPingHttpFallback(t *testing.T) {
 	tests := []struct {
 		reg       name.Registry
 		wantCount int64
-		err       string
-		contains  []string
+		// errSubstrings lists error messages accepted across Go versions. Newer
+		// Go releases surface the plaintext-to-TLS mismatch as "EOF" while older
+		// releases returned "http: server gave HTTP response to HTTPS client".
+		errSubstrings []string
+		contains      []string
 	}{{
 		reg:       mustRegistry("gcr.io"),
 		wantCount: 1,
-		err:       `Get "https://gcr.io/v2/": http: server gave HTTP response to HTTPS client`,
+		errSubstrings: []string{
+			`Get "https://gcr.io/v2/": EOF`,
+			`Get "https://gcr.io/v2/": http: server gave HTTP response to HTTPS client`,
+		},
 	}, {
 		reg:       mustRegistry("ko.localhost"),
 		wantCount: 2,
@@ -214,7 +220,7 @@ func TestPingHttpFallback(t *testing.T) {
 		gotCount = 0
 
 		if err == nil {
-			if test.err != "" {
+			if len(test.errSubstrings) != 0 {
 				t.Error("expected err, got nil")
 			}
 			continue
@@ -225,8 +231,17 @@ func TestPingHttpFallback(t *testing.T) {
 					t.Errorf("expected err to contain %q but did not: %q", c, err)
 				}
 			}
-		} else if got, want := err.Error(), test.err; got != want {
-			t.Errorf("got %q want %q", got, want)
+		} else if len(test.errSubstrings) != 0 {
+			matched := false
+			for _, want := range test.errSubstrings {
+				if err.Error() == want {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				t.Errorf("got %q, want one of %v", err.Error(), test.errSubstrings)
+			}
 		}
 	}
 }

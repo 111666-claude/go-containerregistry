@@ -26,6 +26,11 @@ type basicTransport struct {
 	inner  http.RoundTripper
 	auth   authn.Authenticator
 	target string
+
+	// scheme determines the default port used when canonicalizing hosts for
+	// comparison (80 for http, 443 for https). When empty, the request's own
+	// URL.Scheme is used.
+	scheme string
 }
 
 var _ http.RoundTripper = (*basicTransport)(nil)
@@ -40,10 +45,16 @@ func (bt *basicTransport) RoundTrip(in *http.Request) (*http.Response, error) {
 
 		// http.Client handles redirects at a layer above the http.RoundTripper
 		// abstraction, so to avoid forwarding Authorization headers to places
-		// we are redirected, only set it when the authorization header matches
-		// the host with which we are interacting.
+		// we are redirected, only set it when the request targets the host with
+		// which we are interacting.
 		// In case of redirect http.Client can use an empty Host, check URL too.
-		if in.Host == bt.target || in.URL.Host == bt.target {
+		// Canonicalize both sides so default ports and IPv6 literals compare
+		// correctly (e.g. "example.com" vs "example.com:443", "[::1]:5000").
+		scheme := bt.scheme
+		if scheme == "" {
+			scheme = in.URL.Scheme
+		}
+		if matchesHost(bt.target, in, scheme) {
 			if bearer := auth.RegistryToken; bearer != "" {
 				hdr := fmt.Sprintf("Bearer %s", bearer)
 				in.Header.Set("Authorization", hdr)
